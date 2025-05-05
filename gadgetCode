@@ -1,0 +1,324 @@
+#include <Wire.h>
+// Librerías para MAX30105
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
+// Librería para MLX90614
+#include <Adafruit_MLX90614.h>
+// Librerías para MPU6050
+#include "I2Cdev.h"
+#include "MPU6050.h"
+
+// Configuración de pines I2C para ESP32
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Configuración del sensor MAX30105
+#define MAX30105_BUFFER_LENGTH 100
+
+// Instancias de sensores
+MAX30105 particleSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+MPU6050 motionSensor;
+
+// Buffers para MAX30105
+uint32_t irBuffer[MAX30105_BUFFER_LENGTH];
+uint32_t redBuffer[MAX30105_BUFFER_LENGTH];
+
+// Variables para resultados
+int32_t spo2, heartRate;
+int8_t validSPO2, validHeartRate;
+const float DISTANCE_CORRECTION_FACTOR = 0.7;
+int lastValidHeartRates[5] = {0};
+int filterIndex = 0;
+
+// Variables para MPU6050
+int16_t ax, ay, az, gx, gy, gz;
+float dt, ang_x, ang_y, ang_x_prev, ang_y_prev;
+long tiempo_prev;
+
+// Control de tiempo
+unsigned long ultimaLecturaMAX = 0, ultimaLecturaMLX = 0, ultimaLecturaMPU = 0;
+const unsigned long INTERVALO_MAX = 2000, INTERVALO_MLX = 1000, INTERVALO_MPU = 500;
+
+// Banderas de inicialización
+bool maxInicializado = false, mlxInicializado = false, mpuInicializado = false;
+
+// Función para escanear dispositivos I2C
+void scanI2C() {
+  Serial.println("\nEscaneando dispositivos I2C...");
+  byte count = 0;
+  for (byte i = 8; i < 120; i++) {
+    Wire.beginTransmission(i);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Dispositivo encontrado en: 0x");
+      Serial.println(i, HEX);
+      count++;
+    }
+  }
+  if (count == 0) Serial.println("No se encontraron dispositivos I2C.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- INICIALIZANDO SISTEMA ---");
+
+  // Inicializar I2C con velocidad reducida (100 kHz)
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  Serial.println("I2C inicializado a 100 kHz");
+
+  // Escanear bus I2C (para diagnóstico)
+  scanI2C();
+
+  // Inicializar MLX90614 (primero por ser más sensible)
+  Serial.print("Inicializando MLX90614... ");
+  if (mlx.begin()) {
+    Serial.println("OK");
+    mlxInicializado = true;
+  } else {
+    Serial.println("ERROR");
+  }
+
+  // Inicializar MAX30105 (con velocidad estándar)
+  Serial.print("Inicializando MAX30105... ");
+  if (particleSensor.begin(Wire, I2C_SPEED_STANDARD)) { // ¡Usar STANDARD, no FAST!
+    Serial.println("OK");
+    // Configurar sensor
+    particleSensor.setup(60, 8, 2, 100, 411, 4096);
+    maxInicializado = true;
+    collectInitialSamples();
+  } else {
+    Serial.println("ERROR");
+  }
+
+  // Inicializar MPU6050
+  Serial.print("Inicializando MPU6050... ");
+  motionSensor.initialize();
+  if (motionSensor.testConnection()) {
+    Serial.println("OK");
+    mpuInicializado = true;
+    tiempo_prev = millis();
+  } else {
+    Serial.println("ERROR");
+  }
+
+  Serial.println("\n--- SISTEMA LISTO ---");
+}
+
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // Leer MPU6050 (prioridad alta)
+  if (mpuInicializado && (tiempoActual - ultimaLecturaMPU >= INTERVALO_MPU)) {
+    leerMPU6050();
+    ultimaLecturaMPU = tiempoActual;
+  }
+
+  // Leer MLX90614
+  if (mlxInicializado && (tiempoActual - ultimaLecturaMLX >= INTERVALO_MLX)) {
+    leerMLX90614();
+    ultimaLecturaMLX = tiempoActual;
+  }
+
+  // Leer MAX30105 (prioridad baja)
+  if (maxInicializado && (tiempoActual - ultimaLecturaMAX >= INTERVALO_MAX)) {
+    leerMAX30105();
+    ultimaLecturaMAX = tiempoActual;
+  }
+
+  delay(10); // Pequeña pausa para evitar saturación
+}
+
+void collectInitialSamples() {
+  Serial.println("Recolectando muestras iniciales para calibración MAX30105...");
+  
+  // Recolectar las primeras 100 muestras
+  for (byte i = 0; i < MAX30105_BUFFER_LENGTH; i++) {
+    while (!particleSensor.available()) {
+      particleSensor.check();  // Verificar nuevos datos
+    }
+    
+    // Leer datos
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();  // Pasar a la siguiente muestra
+  }
+  
+  // Calcular frecuencia cardíaca y SpO2 con las primeras 100 muestras
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30105_BUFFER_LENGTH, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+  
+  Serial.println("Calibración inicial completa");
+}
+
+void leerMAX30105() {
+  Serial.println("\n--- DATOS DE OXIMETRÍA Y PULSO (MAX30105) ---");
+  
+  // Mover las últimas 75 muestras al principio del buffer
+  for (byte i = 25; i < 100; i++) {
+    redBuffer[i - 25] = redBuffer[i];
+    irBuffer[i - 25] = irBuffer[i];
+  }
+  
+  // Tomar 25 nuevas muestras
+  for (byte i = 75; i < 100; i++) {
+    while (!particleSensor.available()) {
+      particleSensor.check();
+    }
+    
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+    
+    // Verificar señal adecuada
+    if (irBuffer[i] < 5000) {
+      Serial.println("¡Señal demasiado débil! Verifica la posición del sensor.");
+      return;
+    }
+  }
+  
+  // Recalcular con nuevas muestras
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, MAX30105_BUFFER_LENGTH, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+  
+  // Aplicar correcciones y filtros al ritmo cardíaco
+  processHeartRate();
+  
+  // Mostrar resultados
+  Serial.print("SpO2: ");
+  if (validSPO2 && spo2 >= 0 && spo2 <= 100) {
+    Serial.print(spo2);
+    Serial.println("%");
+  } else {
+    Serial.println("Calculando o valor inválido...");
+  }
+  
+  Serial.print("Ritmo Cardíaco: ");
+  if (validHeartRate && heartRate > 30 && heartRate < 220) {
+    Serial.print(heartRate);
+    Serial.println(" BPM");
+  } else {
+    Serial.println("Calculando o valor fuera de rango normal (30-220 BPM)");
+  }
+  
+  // Información sobre la calidad de la señal
+  unsigned long signalStrength = irBuffer[99];
+  Serial.print("Intensidad de Señal IR: ");
+  Serial.print(signalStrength);
+  if (signalStrength < 10000) {
+    Serial.println(" (MUY DÉBIL)");
+  } else if (signalStrength < 20000) {
+    Serial.println(" (DÉBIL)");
+  } else {
+    Serial.println(" (ADECUADA)");
+  }
+}
+
+void processHeartRate() {
+  // Aplicar correcciones solo a valores válidos y dentro del rango normal
+  if (validHeartRate && heartRate > 30 && heartRate < 220) {
+    // Aplicar factor de corrección por distancia
+    int correctedHeartRate = round(heartRate * signalStrength); ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+    // Actualizar el array circular con el valor corregido
+    lastValidHeartRates[filterIndex] = correctedHeartRate;
+    filterIndex = (filterIndex + 1) % 5;
+    
+    // Ordenar para encontrar la mediana
+    int tempArray[5];
+    memcpy(tempArray, lastValidHeartRates, sizeof(lastValidHeartRates));
+    
+    // Simple ordenamiento bubble sort
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4-i; j++) {
+        if (tempArray[j] > tempArray[j+1]) {
+          int temp = tempArray[j];
+          tempArray[j] = tempArray[j+1];
+          tempArray[j+1] = temp;
+        }
+      }
+    }
+    
+    // La mediana es el valor central después de ordenar
+    int filteredHeartRate = tempArray[2];
+    
+    // Solo usar el valor filtrado si hay suficientes muestras válidas
+    if (lastValidHeartRates[0] > 0) {
+      heartRate = filteredHeartRate;
+    } else {
+      heartRate = correctedHeartRate;
+    }
+  }
+}
+
+void leerMLX90614() {
+  Serial.println("\n--- DATOS DE TEMPERATURA (MLX90614) ---");
+  
+  float tempAmbiente = mlx.readAmbientTempC();
+  float tempObjeto = mlx.readObjectTempC();
+  
+  Serial.print("Temperatura Ambiente: ");
+  Serial.print(tempAmbiente);
+  Serial.println(" °C");
+  
+  Serial.print("Temperatura del Objeto: ");
+  Serial.print(tempObjeto);
+  Serial.println(" °C");
+  
+  // Evaluación de la temperatura corporal
+  if (tempObjeto > 38.0) {
+    Serial.println("¡ALERTA! Temperatura elevada detectada");
+  } else if (tempObjeto > 37.0) {
+    Serial.println("Temperatura ligeramente elevada");
+  } else if (tempObjeto < 35.0) {
+    Serial.println("¡ALERTA! Temperatura corporal baja");
+  } else {
+    Serial.println("Temperatura normal");
+  }
+}
+
+void leerMPU6050() {
+  // Leer aceleraciones y velocidades angulares
+  motionSensor.getAcceleration(&ax, &ay, &az);
+  motionSensor.getRotation(&gx, &gy, &gz);
+
+  dt = (millis() - tiempo_prev) / 1000.0;
+  tiempo_prev = millis();
+
+  // Calcular ángulos a partir de acelerómetro
+  float accel_ang_x = atan(ay / sqrt(pow(ax, 2) + pow(az, 2))) * (180.0 / 3.14);
+  float accel_ang_y = atan(-ax / sqrt(pow(ay, 2) + pow(az, 2))) * (180.0 / 3.14);
+
+  // Filtro complementario para estabilizar la lectura
+  ang_x = 0.98 * (ang_x_prev + (gx / 131.0) * dt) + 0.02 * accel_ang_x;
+  ang_y = 0.98 * (ang_y_prev + (gy / 131.0) * dt) + 0.02 * accel_ang_y;
+
+  ang_x_prev = ang_x;
+  ang_y_prev = ang_y;
+
+  // Solo imprimir cada varios ciclos para no saturar el monitor
+  static int contadorMPU = 0;
+  if (++contadorMPU >= 5) { // Mostrar cada 5 ciclos (1 segundo aprox.)
+    Serial.println("\n--- DATOS DE MOVIMIENTO (MPU6050) ---");
+    Serial.print("Rotación en X: ");
+    Serial.print(ang_x);
+    Serial.print("°\tRotación en Y: ");
+    Serial.print(ang_y);
+    Serial.println("°");
+    
+    // Detectar posibles caídas o movimientos bruscos
+    float accelTotal = sqrt(pow(ax/16384.0, 2) + pow(ay/16384.0, 2) + pow(az/16384.0, 2));
+    if (accelTotal > 2.0) { // Más de 2G de aceleración
+      Serial.println("¡ALERTA! Posible movimiento brusco o caída detectada");
+    }
+    
+    // Detectar posición
+    if (abs(ang_x) < 10 && abs(ang_y) < 10) {
+      Serial.println("Posición: Horizontal");
+    } else if (abs(ang_x) > 70) {
+      Serial.println("Posición: Vertical");
+    } else {
+      Serial.println("Posición: Inclinada");
+    }
+    
+    contadorMPU = 0;
+  }
+}
