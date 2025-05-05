@@ -1,3 +1,5 @@
+Se esta diseñando un dispositivo que muestre signos vitales a un precio más económico en comparación de otros en el mercado.
+
 ![image](https://github.com/user-attachments/assets/d9936156-e5f8-4d8b-955e-76ba1ff24858)
 
 
